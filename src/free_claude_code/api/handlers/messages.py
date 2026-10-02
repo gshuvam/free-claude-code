@@ -4,6 +4,7 @@ import asyncio
 import sys
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, replace
+from typing import Any
 
 from fastapi.responses import JSONResponse, Response
 from loguru import logger
@@ -126,6 +127,79 @@ class MessagesHandler:
                 source="api",
                 preserved_error=sys.exception(),
             )
+
+    async def execute_messages_stream(
+        self, request_data: MessagesRequest, *, request_id: str
+    ) -> tuple[AsyncIterator[str], str]:
+        """Execute request and return underlying stream and resolved model."""
+        require_non_empty_messages(request_data.messages)
+        routed = self._model_router.resolve_messages_request(request_data)
+        routed = self._apply_message_routing_policies(routed)
+        record_request_route(
+            routed.resolved.primary.provider_id,
+            routed.resolved.primary.provider_model,
+        )
+        tool_body = self._web_tools.try_stream_messages(routed, request_id=request_id)
+        result = (
+            _MessagesStreamResult(tool_body)
+            if tool_body is not None
+            else self._intercept_local_optimization(routed)
+        )
+        if result is None:
+            logger.debug("No optimization matched, routing to provider")
+            result = _MessagesStreamResult(
+                self._provider_executor.stream_messages(
+                    routed,
+                    raw_log_payload=routed.request.model_dump,
+                    request_id=request_id,
+                )
+            )
+        if routed.reasoning.control is ReasoningControl.PREFER_OFF and isinstance(
+            result, _MessagesStreamResult
+        ):
+            result = _MessagesStreamResult(classifier_response(result.body))
+
+        resolved_model = (
+            routed.resolved.original_model or routed.resolved.primary.provider_model
+        )
+        if isinstance(result, _MessagesStreamResult):
+            return result.body, resolved_model
+
+        async def _complete_to_sse() -> AsyncIterator[str]:
+            import json
+
+            resp = result.response
+            if isinstance(resp, JSONResponse):
+                content_dict: dict[str, Any] = json.loads(bytes(resp.body))
+            elif isinstance(resp, dict):
+                content_dict = resp
+            else:
+                content_dict = {}
+
+            text_content = ""
+            for part in content_dict.get("content", []):
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_content += part.get("text", "")
+
+            yield (
+                f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': content_dict.get('id', 'msg_1'), 'type': 'message', 'role': 'assistant', 'model': resolved_model, 'content': [], 'usage': content_dict.get('usage', {})}})}\n\n"
+            )
+            if text_content:
+                yield (
+                    f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                )
+                yield (
+                    f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': text_content}})}\n\n"
+                )
+                yield (
+                    f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                )
+            yield (
+                f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': content_dict.get('stop_reason', 'end_turn')}, 'usage': content_dict.get('usage', {})})}\n\n"
+            )
+            yield 'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+
+        return _complete_to_sse(), resolved_model
 
     async def create(
         self, request_data: MessagesRequest, *, request_id: str | None = None

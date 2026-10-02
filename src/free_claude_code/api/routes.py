@@ -5,9 +5,11 @@ from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from loguru import logger
 from pydantic import ValidationError
 
+from free_claude_code.api.models.chat_completions import ChatCompletionRequest
 from free_claude_code.application.errors import ApplicationError, InvalidRequestError
 from free_claude_code.application.ports import ProviderResolver, RequestRuntimeLease
 from free_claude_code.application.routing import ModelRouter, supports_native_messages
@@ -37,13 +39,16 @@ from .dependencies import (
     resolve_provider,
 )
 from .handlers import (
+    ChatCompletionsHandler,
     EmbeddingsHandler,
     MessagesHandler,
     ResponsesHandler,
     TokenCountHandler,
 )
 from .model_catalog import (
+    DISCOVERED_MODEL_CREATED_AT,
     ModelCatalogView,
+    ModelResponse,
     ModelsListResponse,
     build_models_list_response,
     build_muse_models_list_response,
@@ -197,6 +202,44 @@ async def _create_embeddings_response(
             await lease.release()
 
 
+async def _create_chat_completions_response(
+    services: ApiServices,
+    request_data: ChatCompletionRequest,
+    *,
+    request_id: str,
+    request_headers: Mapping[str, str] | None = None,
+) -> object:
+    lease: RequestRuntimeLease | None = None
+    try:
+        lease = await services.requests.acquire()
+        await lease.wait_for_token_estimation()
+        messages_handler = MessagesHandler(
+            lease.settings,
+            web_tools=services.web_tools,
+            provider_resolver=_provider_resolver(lease),
+            token_counter=get_token_count,
+            generation_id=lease.generation_id,
+            request_headers=request_headers,
+            model_info_lookup=lease.model_info,
+        )
+        handler = ChatCompletionsHandler(messages_handler)
+        response = await handler.create(request_data, request_id=request_id)
+    except ApplicationError as exc:
+        if lease is not None:
+            await lease.release()
+        return ordinary_application_error_response(
+            exc,
+            wire_api="chat_completions",
+            request_id=request_id,
+        )
+    except BaseException:
+        if lease is not None:
+            await lease.release()
+        raise
+    assert lease is not None
+    return await bind_response_lifetime(response, lease.release)
+
+
 def _probe_response(allow: str) -> Response:
     return Response(status_code=204, headers={"Allow": allow})
 
@@ -240,6 +283,27 @@ async def create_response(
 
 @router.api_route("/v1/responses", methods=["HEAD", "OPTIONS"])
 async def probe_responses(_auth=Depends(require_proxy_auth)):
+    return _probe_response("POST, HEAD, OPTIONS")
+
+
+@router.post("/v1/chat/completions")
+async def create_chat_completion(
+    request: Request,
+    request_data: ChatCompletionRequest,
+    services: ApiServices = Depends(get_services),
+    _auth=Depends(require_proxy_auth),
+):
+    """Create an OpenAI Chat-compatible completion through this proxy."""
+    return await _create_chat_completions_response(
+        services,
+        request_data,
+        request_id=get_request_id(request),
+        request_headers=request.headers,
+    )
+
+
+@router.api_route("/v1/chat/completions", methods=["HEAD", "OPTIONS"])
+async def probe_chat_completions(_auth=Depends(require_proxy_auth)):
     return _probe_response("POST, HEAD, OPTIONS")
 
 
@@ -359,6 +423,70 @@ async def list_models(
         snapshot,
         view=view or x_fcc_model_view or ModelCatalogView.CLAUDE,
     )
+
+
+@router.get(
+    "/v1/models/{model_id:path}",
+    response_model=ModelResponse,
+    response_model_exclude_none=True,
+)
+async def get_model(
+    model_id: str,
+    view: ModelCatalogView | None = None,
+    x_fcc_model_view: ModelCatalogView | None = Header(default=None),
+    services: ApiServices = Depends(get_services),
+    _auth=Depends(require_proxy_auth),
+):
+    """Retrieve details for a single model ID."""
+    trace_event(
+        stage="ingress",
+        event="free_claude_code.api.models.get",
+        source="api",
+        model_id=model_id,
+    )
+    snapshot = await services.requests.wait_for_catalog()
+    catalog_response = build_models_list_response(
+        snapshot.settings,
+        snapshot,
+        view=view or x_fcc_model_view or ModelCatalogView.CLAUDE,
+    )
+    for model in catalog_response.data:
+        if model.id == model_id or model.provider_model_ref == model_id:
+            return model
+
+    settings = snapshot.settings
+    configured = (
+        settings.model,
+        settings.model_fable,
+        settings.model_opus,
+        settings.model_sonnet,
+        settings.model_haiku,
+    )
+    if model_id in configured or any(
+        m and (model_id == m or model_id == m.partition("/")[2]) for m in configured
+    ):
+        return ModelResponse(
+            id=model_id,
+            display_name=model_id,
+            created_at=DISCOVERED_MODEL_CREATED_AT,
+        )
+
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": {
+                "message": f"The model '{model_id}' does not exist",
+                "type": "invalid_request_error",
+                "param": "model",
+                "code": "model_not_found",
+            }
+        },
+    )
+
+
+@router.api_route("/v1/models/{model_id:path}", methods=["HEAD", "OPTIONS"])
+async def probe_get_model(_auth=Depends(require_proxy_auth)):
+    return _probe_response("GET, HEAD, OPTIONS")
 
 
 @router.get(

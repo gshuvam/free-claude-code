@@ -100,11 +100,15 @@ def create_app(services: ApiServices) -> FastAPI:
     @app.exception_handler(ApplicationError)
     async def application_error_handler(request: Request, exc: ApplicationError):
         """Serialize defensive application failures in the selected wire protocol."""
+        path = request.url.path
+        is_openai_wire = path in (
+            "/v1/responses",
+            "/v1/chat/completions",
+            "/v1/embeddings",
+        ) or path.startswith("/v1/models")
         return ordinary_application_error_response(
             exc,
-            wire_api=(
-                "responses" if request.url.path == "/v1/responses" else "messages"
-            ),
+            wire_api="chat_completions" if is_openai_wire else "messages",
             request_id=get_request_id(request),
         )
 
@@ -131,7 +135,11 @@ def create_app(services: ApiServices) -> FastAPI:
                     type(exc).__name__,
                 )
             message = safe_exception_message(exc)
-            if request.url.path == "/v1/responses":
+            if request.url.path in (
+                "/v1/responses",
+                "/v1/chat/completions",
+                "/v1/embeddings",
+            ) or request.url.path.startswith("/v1/models"):
                 content = openai_error_payload(message=message, error_type="api_error")
             else:
                 content = anthropic_error_payload(

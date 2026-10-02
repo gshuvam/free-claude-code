@@ -1,6 +1,7 @@
 """FastAPI streaming response wrappers for public API wire formats."""
 
 import asyncio
+import json
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -41,7 +42,7 @@ PreStartErrorResponse = Callable[[BaseException], Response]
 TerminalFrameEmitter = Callable[[str, str, BaseException], str]
 TerminalFailureObserver = Callable[[BaseException], None]
 ReleaseResponseResource = Callable[[], Awaitable[None]]
-WireApi = Literal["messages", "responses"]
+WireApi = Literal["messages", "responses", "chat_completions"]
 
 
 class EmptyStreamError(RuntimeError):
@@ -420,6 +421,68 @@ def _trace_responses_terminal_failure(
     failure = find_execution_failure(exc)
     trace_terminal_execution_error(
         wire_api="responses",
+        request_id=request_id,
+        status_code=failure.status_code if failure is not None else 500,
+        error_type=(
+            openai_error_type_for_failure(failure)
+            if failure is not None
+            else "api_error"
+        ),
+        error=exc,
+    )
+
+
+OPENAI_CHAT_SSE_HEADERS: Mapping[str, str] = {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache",
+    "connection": "keep-alive",
+}
+
+
+async def openai_chat_sse_streaming_response(
+    body: AsyncIterator[str],
+    *,
+    headers: Mapping[str, str],
+    pre_start_error_response: PreStartErrorResponse,
+    request_id: str,
+) -> Response:
+    """Return a streaming response for OpenAI Chat Completions-style SSE."""
+    return await _first_chunk_streaming_response(
+        body,
+        headers=headers,
+        pre_start_error_response=pre_start_error_response,
+        terminal_frame=_openai_chat_terminal_frame,
+        terminal_failure_observer=lambda exc: _trace_chat_terminal_failure(
+            exc,
+            request_id=request_id,
+        ),
+    )
+
+
+def _openai_chat_terminal_frame(
+    _first_chunk: str,
+    _latest_chunk: str,
+    exc: BaseException,
+) -> str:
+    failure = find_execution_failure(exc)
+    err_msg = failure.message if failure is not None else safe_exception_message(exc)
+    err_type = (
+        openai_error_type_for_failure(failure.kind)
+        if failure is not None
+        else "api_error"
+    )
+    err_payload = {"error": {"message": err_msg, "type": err_type}}
+    return f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n"
+
+
+def _trace_chat_terminal_failure(
+    exc: BaseException,
+    *,
+    request_id: str,
+) -> None:
+    failure = find_execution_failure(exc)
+    trace_terminal_execution_error(
+        wire_api="chat_completions",
         request_id=request_id,
         status_code=failure.status_code if failure is not None else 500,
         error_type=(
