@@ -120,6 +120,8 @@ def test_installed_update_delegates_and_survives_replacement(tmp_path, outcome):
         UV_TOOL_BIN_DIR=str(area / "bin"),
         UV_NO_CONFIG="1",
         UV_PYTHON_DOWNLOADS="never",
+        NO_PROXY="*",
+        no_proxy="*",
         FCC_TEST_LAUNCHER=str(
             area / "bin" / ("fcc-update.cmd" if os.name == "nt" else "fcc-update")
         ),

@@ -7,6 +7,7 @@ from dataclasses import replace
 from functools import partial
 
 import httpx
+from loguru import logger
 
 from free_claude_code.application.errors import InvalidRequestError
 from free_claude_code.application.model_metadata import ProviderModelInfo
@@ -17,6 +18,7 @@ from free_claude_code.core.anthropic.native import (
     build_native_messages_request,
 )
 from free_claude_code.core.anthropic.native_stream import NativeMessagesRelay
+from free_claude_code.core.api_key_pool import ApiKeyPool
 from free_claude_code.core.failures import ExecutionFailure
 from free_claude_code.core.history_replay import ReplayOrigin, prepare_history
 from free_claude_code.core.json_types import JsonObject
@@ -86,6 +88,8 @@ class AnthropicMessagesTransport:
         replay_scope: str,
         read_timeout_s: float,
         capabilities: MessagesModelCapabilities = MessagesModelCapabilities(),
+        api_key: str | None = None,
+        api_key_pool: ApiKeyPool | None = None,
     ) -> None:
         self._client = client
         self._admission = admission
@@ -93,6 +97,22 @@ class AnthropicMessagesTransport:
         self._replay_scope = replay_scope
         self._read_timeout_s = read_timeout_s
         self._capabilities = capabilities
+        self._api_key = api_key
+        self._api_key_pool = api_key_pool
+
+    def _rotate_api_key(self) -> bool:
+        if self._api_key_pool is None:
+            return False
+        new_key = self._api_key_pool.rotate()
+        if new_key is None:
+            return False
+        self._api_key = new_key
+        logger.info(
+            "{}: rotated to next API key (key index={})",
+            self._provider_name,
+            self._api_key_pool._index,
+        )
+        return True
 
     def _effective_capabilities(
         self, model_info: ProviderModelInfo | None
@@ -308,8 +328,18 @@ class AnthropicMessagesTransport:
                     )
                 base_url = endpoint.base_url.rstrip("/")
                 path = "/messages"
-                response = scope.retain(
-                    await self._client.send(
+                pool = self._api_key_pool
+                keys_to_try = pool.size if pool else 1
+                response = None
+                for _ in range(keys_to_try):
+                    if self._api_key:
+                        if "x-api-key" in headers:
+                            headers["x-api-key"] = self._api_key
+                        elif "authorization" in headers:
+                            headers["authorization"] = f"Bearer {self._api_key}"
+                        else:
+                            headers["x-api-key"] = self._api_key
+                    res = await self._client.send(
                         self._client.build_request(
                             "POST",
                             f"{base_url}{path}",
@@ -318,9 +348,14 @@ class AnthropicMessagesTransport:
                         ),
                         stream=True,
                     )
-                )
-                if not response.is_success:
-                    raise await messages_status_error(response)
+                    if res.status_code == 429 and self._rotate_api_key():
+                        await res.aclose()
+                        continue
+                    response = scope.retain(res)
+                    if not response.is_success:
+                        raise await messages_status_error(response)
+                    break
+                assert response is not None
                 content_type = response.headers.get("content-type", "")
                 if "text/event-stream" not in content_type.lower():
                     raise RetryableProviderProtocolError(

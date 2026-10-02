@@ -145,6 +145,8 @@ class AnthropicProvider(BaseProvider):
             replay_scope="anthropic",
             read_timeout_s=self._config.http_read_timeout,
             capabilities=record.messages,
+            api_key=self._config.api_key,
+            api_key_pool=self._config.api_key_pool,
         )
 
     def stream_native_messages(
@@ -155,6 +157,8 @@ class AnthropicProvider(BaseProvider):
         response_model: str | None = None,
         request_headers: Mapping[str, str] | None = None,
     ) -> AsyncIterator[str]:
+        if self._config.api_key_pool is not None:
+            self._config.api_key_pool.reset()
         body, headers = native_request(request.body, request_headers)
         try:
             body = restore_native_history(
@@ -188,6 +192,8 @@ class AnthropicProvider(BaseProvider):
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
     ) -> AsyncIterator[str]:
+        if self._config.api_key_pool is not None:
+            self._config.api_key_pool.reset()
         record = await self.model_record(request.model)
         stream = self._transport(record).stream_messages(
             request,

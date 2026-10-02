@@ -440,6 +440,9 @@ class Settings(BaseModel):
     model_haiku: OptionalNonEmptyString = Field(
         default=None, validation_alias="MODEL_HAIKU"
     )
+    model_embedding: str = Field(
+        default="mock/embedding-mock", validation_alias="MODEL_EMBEDDING"
+    )
     model_fallbacks: OptionalModelFallbacks = Field(
         default=None,
         validation_alias="MODEL_FALLBACKS",
@@ -883,12 +886,29 @@ class Settings(BaseModel):
             raise ValueError("MODEL_FALLBACKS must not contain duplicate model refs.")
         return validated
 
+    @field_validator("model_embedding")
+    @classmethod
+    def validate_embedding_model_format(cls, v: str) -> str:
+        if "/" not in v:
+            raise ValueError(
+                "Embedding model must be prefixed with provider type. "
+                "Format: provider_type/model/name"
+            )
+        provider = v.split("/", 1)[0]
+        if provider != "mock" and provider not in SUPPORTED_PROVIDER_IDS:
+            supported = ", ".join(f"'{p}'" for p in ["mock", *SUPPORTED_PROVIDER_IDS])
+            raise ValueError(f"Invalid provider: '{provider}'. Supported: {supported}")
+        return v
+
     @model_validator(mode="after")
     def check_nvidia_nim_api_key(self) -> Settings:
+        has_valid_key = self.nvidia_nim_api_key is not None and any(
+            k.strip() for k in self.nvidia_nim_api_key.split(",") if k.strip()
+        )
         if (
             self.voice_note_enabled
             and self.whisper_device == "nvidia_nim"
-            and self.nvidia_nim_api_key is None
+            and not has_valid_key
         ):
             raise ValueError(
                 "NVIDIA_NIM_API_KEY is required when WHISPER_DEVICE is 'nvidia_nim'. "

@@ -24,6 +24,7 @@ from free_claude_code.core.anthropic.native import (
     validate_messages_json,
 )
 from free_claude_code.core.anthropic.passthrough import NativeMessagesRequest
+from free_claude_code.core.embeddings import EmbeddingRequest
 from free_claude_code.core.json_types import JsonObject
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.trace import trace_event
@@ -35,7 +36,12 @@ from .dependencies import (
     require_proxy_auth,
     resolve_provider,
 )
-from .handlers import MessagesHandler, ResponsesHandler, TokenCountHandler
+from .handlers import (
+    EmbeddingsHandler,
+    MessagesHandler,
+    ResponsesHandler,
+    TokenCountHandler,
+)
 from .model_catalog import (
     ModelCatalogView,
     ModelsListResponse,
@@ -164,6 +170,33 @@ async def _create_responses_response(
     return await bind_response_lifetime(response, lease.release)
 
 
+async def _create_embeddings_response(
+    services: ApiServices,
+    request_data: EmbeddingRequest,
+    *,
+    request_id: str,
+) -> object:
+    lease: RequestRuntimeLease | None = None
+    try:
+        lease = await services.requests.acquire()
+        handler = EmbeddingsHandler(
+            lease.settings,
+            provider_resolver=_provider_resolver(lease),
+        )
+        return await handler.create(request_data)
+    except ApplicationError as exc:
+        if lease is not None:
+            await lease.release()
+        return ordinary_application_error_response(
+            exc,
+            wire_api="responses",
+            request_id=request_id,
+        )
+    finally:
+        if lease is not None:
+            await lease.release()
+
+
 def _probe_response(allow: str) -> Response:
     return Response(status_code=204, headers={"Allow": allow})
 
@@ -207,6 +240,26 @@ async def create_response(
 
 @router.api_route("/v1/responses", methods=["HEAD", "OPTIONS"])
 async def probe_responses(_auth=Depends(require_proxy_auth)):
+    return _probe_response("POST, HEAD, OPTIONS")
+
+
+@router.post("/v1/embeddings")
+async def create_embeddings(
+    request: Request,
+    request_data: EmbeddingRequest,
+    services: ApiServices = Depends(get_services),
+    _auth=Depends(require_proxy_auth),
+):
+    """Create embedding vector(s) for the input text."""
+    return await _create_embeddings_response(
+        services,
+        request_data,
+        request_id=get_request_id(request),
+    )
+
+
+@router.api_route("/v1/embeddings", methods=["HEAD", "OPTIONS"])
+async def probe_embeddings(_auth=Depends(require_proxy_auth)):
     return _probe_response("POST, HEAD, OPTIONS")
 
 

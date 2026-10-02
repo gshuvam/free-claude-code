@@ -3,11 +3,13 @@
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from free_claude_code.application.errors import InvalidRequestError
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.anthropic.passthrough import NativeMessagesRequest
+from free_claude_code.core.api_key_pool import ApiKeyPool
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
 
@@ -28,6 +30,7 @@ class ProviderConfig:
     proxy: str | None
     log_raw_sse_events: bool
     log_api_error_tracebacks: bool
+    api_key_pool: ApiKeyPool | None = None
 
 
 class BaseProvider(ABC):
@@ -83,3 +86,15 @@ class BaseProvider(ABC):
         model_info: ProviderModelInfo | None = None,
     ) -> AsyncIterator[str]:
         """Validate the request before yielding OpenAI Responses SSE events."""
+
+    async def get_embedding(
+        self,
+        texts: list[str],
+        model: str,
+        dimensions: int | None = None,
+        **kwargs: Any,
+    ) -> list[list[float]]:
+        """Return embedding vectors for a list of texts."""
+        raise NotImplementedError(
+            f"Embeddings are not supported by {self.__class__.__name__}"
+        )

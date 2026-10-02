@@ -32,6 +32,7 @@ from free_claude_code.core.anthropic.streaming import (
     parse_complete_tool_input,
     tool_schemas_by_name,
 )
+from free_claude_code.core.api_key_pool import ApiKeyPool
 from free_claude_code.core.diagnostics import (
     exception_cause_types,
     redacted_exception_traceback,
@@ -454,6 +455,8 @@ class OpenAIChatTransport:
         log_raw_sse_events: bool,
         log_api_error_tracebacks: bool,
         endpoint_transport: httpx2.AsyncBaseTransport | None = None,
+        rotate_api_key: Callable[[], bool] | None = None,
+        api_key_pool: ApiKeyPool | None = None,
     ) -> None:
         self._client = client
         self._admission = admission
@@ -464,7 +467,33 @@ class OpenAIChatTransport:
         self._log_raw_sse_events = log_raw_sse_events
         self._log_api_error_tracebacks = log_api_error_tracebacks
         self._endpoint_transport = endpoint_transport
+        self._rotate_api_key_callback = rotate_api_key
+        self._api_key_pool = api_key_pool
         self._model_output_caps: dict[str, int] = {}
+
+    def update_client(self, client: AsyncOpenAI) -> None:
+        self._client = client
+
+    def _rotate_api_key(self) -> bool:
+        if self._rotate_api_key_callback is not None:
+            return self._rotate_api_key_callback()
+        if self._api_key_pool is not None:
+            new_key = self._api_key_pool.rotate()
+            if new_key is not None:
+                if hasattr(self._client, "api_key"):
+                    self._client.api_key = new_key
+                return True
+        return False
+
+    def _is_rate_limit_error(self, error: Exception) -> bool:
+        from openai import RateLimitError
+
+        if isinstance(error, RateLimitError):
+            return True
+        response = getattr(error, "response", None)
+        if response is not None and getattr(response, "status_code", None) == 429:
+            return True
+        return getattr(error, "status_code", None) == 429
 
     def _log_stream_transport_error(
         self,
@@ -625,12 +654,22 @@ class OpenAIChatTransport:
                         structured_details=self._profile.structured_reasoning_details,
                     ),
                 )
-                stream = OpenAIStreamAdapter(
-                    await client.chat.completions.create(
-                        **create_body,
-                        stream=True,
-                    )
-                )
+                pool = self._api_key_pool
+                keys_to_try = pool.size if pool else 1
+                stream_raw = None
+                for _ in range(keys_to_try):
+                    try:
+                        stream_raw = await client.chat.completions.create(
+                            **create_body,
+                            stream=True,
+                        )
+                        break
+                    except Exception as exc:
+                        if self._is_rate_limit_error(exc) and self._rotate_api_key():
+                            continue
+                        raise
+                assert stream_raw is not None
+                stream = OpenAIStreamAdapter(stream_raw)
                 stream = self._behavior.normalize_stream(stream, body)
                 retain_attempt = True
                 return stream, body, attempt, create_body

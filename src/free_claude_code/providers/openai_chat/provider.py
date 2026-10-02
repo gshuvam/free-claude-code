@@ -1,11 +1,13 @@
 """Provider identity, HTTP resource ownership, and model discovery."""
 
+import asyncio
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 from typing import Any
 
 import httpx2
-from openai import AsyncOpenAI
+from loguru import logger
+from openai import AsyncOpenAI, RateLimitError
 
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.core.anthropic.models import MessagesRequest
@@ -79,6 +81,8 @@ class OpenAIChatProvider(BaseProvider):
             log_raw_sse_events=config.log_raw_sse_events,
             log_api_error_tracebacks=config.log_api_error_tracebacks,
             endpoint_transport=endpoint_transport,
+            rotate_api_key=self._rotate_api_key,
+            api_key_pool=config.api_key_pool,
         )
 
     async def cleanup(self) -> None:
@@ -202,6 +206,35 @@ class OpenAIChatProvider(BaseProvider):
             collection_field=listing.collection_field,
         )
 
+    def _rotate_api_key(self) -> bool:
+        """Advance to the next key in the pool. Return True if a new key is available."""
+        pool = self._config.api_key_pool
+        if pool is None:
+            return False
+        new_key = pool.rotate()
+        if new_key is None:
+            return False
+
+        self._api_key = new_key
+        if hasattr(self._client, "api_key"):
+            self._client.api_key = new_key
+        else:
+            old_client = self._client
+            asyncio.create_task(old_client.close())
+
+            self._client = create_chat_client(
+                replace(self._config, api_key=new_key),
+                base_url=self._base_url,
+                provider_name=self._provider_name,
+            )
+            self._chat.update_client(self._client)
+        logger.info(
+            "{}: rotated to next API key (key index={})",
+            self._provider_name,
+            pool._index,
+        )
+        return True
+
     def stream_messages(
         self,
         request: MessagesRequest,
@@ -214,6 +247,8 @@ class OpenAIChatProvider(BaseProvider):
         endpoint_context: EndpointContext | None = None,
         request_headers: Mapping[str, str] | None = None,
     ) -> AsyncIterator[str]:
+        if self._config.api_key_pool is not None:
+            self._config.api_key_pool.reset()
         return self._chat.stream_messages(
             request,
             input_tokens=input_tokens,
@@ -236,6 +271,8 @@ class OpenAIChatProvider(BaseProvider):
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
     ) -> AsyncIterator[str]:
+        if self._config.api_key_pool is not None:
+            self._config.api_key_pool.reset()
         return self._chat.stream_responses(
             request,
             input_tokens=input_tokens,
@@ -244,3 +281,62 @@ class OpenAIChatProvider(BaseProvider):
             reasoning=reasoning,
             endpoint_context=endpoint_context,
         )
+
+    async def get_embedding(
+        self,
+        texts: list[str],
+        model: str,
+        dimensions: int | None = None,
+        **kwargs: Any,
+    ) -> list[list[float]]:
+        """Return embedding vectors for a list of texts using OpenAI-compatible embeddings client."""
+        request_kwargs: dict[str, Any] = {}
+        if dimensions is not None:
+            request_kwargs["dimensions"] = dimensions
+        if kwargs:
+            request_kwargs["extra_body"] = kwargs
+
+        pool = self._config.api_key_pool
+        keys_to_try = pool.size if pool else 1
+        last_exc: Exception | None = None
+
+        if pool is not None:
+            pool.reset()
+
+        for _ in range(keys_to_try):
+            try:
+                try:
+                    response = await self._client.embeddings.create(
+                        input=texts,
+                        model=model,
+                        **request_kwargs,
+                    )
+                    return [item.embedding for item in response.data]
+                except Exception as error:
+                    if isinstance(error, RateLimitError):
+                        raise
+                    if request_kwargs:
+                        logger.warning(
+                            "{}_EMBEDDING: Upstream error when using extra parameters {}: {}. "
+                            "Retrying with basic request (no extra parameters).",
+                            self._provider_name,
+                            request_kwargs,
+                            error,
+                        )
+                        response = await self._client.embeddings.create(
+                            input=texts,
+                            model=model,
+                        )
+                        return [item.embedding for item in response.data]
+                    raise
+            except RateLimitError as e:
+                if not self._rotate_api_key():
+                    raise
+                last_exc = e
+                logger.warning(
+                    "{}: 429 on embedding key, rotating to next key",
+                    self._provider_name,
+                )
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Failed to get embeddings after trying all keys")

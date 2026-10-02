@@ -70,6 +70,7 @@ ROUTING_FIELDS = (
     "model_opus",
     "model_sonnet",
     "model_haiku",
+    "model_embedding",
     "model_fallbacks",
 )
 REASONING_FIELDS = (

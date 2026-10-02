@@ -596,3 +596,52 @@ def test_settings_defaults_do_not_contain_empty_enum_strings() -> None:
     for _name, value in Settings():
         if isinstance(value, Enum):
             assert value.value
+
+
+def test_nvidia_nim_api_key_multi_key_validation() -> None:
+    """Test multi-key validation for NVIDIA_NIM_API_KEY when voice note is enabled."""
+    s = Settings(
+        voice_note_enabled=True,
+        whisper_device="nvidia_nim",
+        nvidia_nim_api_key="key1",
+    )
+    assert s.nvidia_nim_api_key == "key1"
+
+    s = Settings(
+        voice_note_enabled=True,
+        whisper_device="nvidia_nim",
+        nvidia_nim_api_key="key1,key2,key3",
+    )
+    assert s.nvidia_nim_api_key == "key1,key2,key3"
+
+    s = Settings(
+        voice_note_enabled=True,
+        whisper_device="nvidia_nim",
+        nvidia_nim_api_key="  key1 , , key2  ",
+    )
+    assert s.nvidia_nim_api_key == "key1 , , key2"
+
+    with pytest.raises(ValidationError, match="NVIDIA_NIM_API_KEY is required"):
+        Settings(
+            voice_note_enabled=True,
+            whisper_device="nvidia_nim",
+            nvidia_nim_api_key=" , , ",
+        )
+
+    with pytest.raises(ValidationError, match="NVIDIA_NIM_API_KEY is required"):
+        Settings(
+            voice_note_enabled=True,
+            whisper_device="nvidia_nim",
+            nvidia_nim_api_key=None,
+        )
+
+
+def test_model_embedding_validation() -> None:
+    s = Settings()
+    assert s.model_embedding == "mock/embedding-mock"
+
+    s2 = Settings(model_embedding="nvidia_nim/nvidia/llama-nemotron-embed-vl-1b-v2")
+    assert s2.model_embedding == "nvidia_nim/nvidia/llama-nemotron-embed-vl-1b-v2"
+
+    with pytest.raises(ValidationError, match="Invalid provider"):
+        Settings(model_embedding="invalid_provider/some-model")

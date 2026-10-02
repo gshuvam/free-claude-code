@@ -4,7 +4,17 @@ from free_claude_code.application.errors import ApplicationUnavailableError
 from free_claude_code.config.custom_providers import CustomProviderDefinition
 from free_claude_code.config.provider_catalog import ProviderDescriptor
 from free_claude_code.config.settings import Settings
+from free_claude_code.core.api_key_pool import ApiKeyPool
 from free_claude_code.providers.base import ProviderConfig
+
+
+def _build_api_key_pool(raw_credential: str | None) -> ApiKeyPool | None:
+    if not raw_credential:
+        return None
+    keys = [k.strip() for k in raw_credential.split(",") if k.strip()]
+    if len(keys) <= 1:
+        return None
+    return ApiKeyPool(raw_credential)
 
 
 def string_setting(settings: Settings, attr_name: str | None) -> str | None:
@@ -56,6 +66,8 @@ def build_provider_config(
     """Build shared provider configuration for one provider descriptor."""
     credential = provider_credential(descriptor, settings)
     require_provider_credential(descriptor, credential)
+    pool = _build_api_key_pool(credential)
+    api_key = pool.current_key() if pool else credential
     base_url = string_setting(settings, descriptor.base_url_attr)
     resolved_base_url = base_url or descriptor.default_base_url
     if not resolved_base_url:
@@ -78,7 +90,7 @@ def build_provider_config(
         )
     proxy = string_setting(settings, descriptor.proxy_attr)
     return ProviderConfig(
-        api_key=credential,
+        api_key=api_key,
         base_url=resolved_base_url,
         http_read_timeout=settings.http_read_timeout,
         http_write_timeout=settings.http_write_timeout,
@@ -86,14 +98,18 @@ def build_provider_config(
         proxy=proxy,
         log_raw_sse_events=settings.log_raw_sse_events,
         log_api_error_tracebacks=settings.log_api_error_tracebacks,
+        api_key_pool=pool,
     )
 
 
 def build_custom_provider_config(
     definition: CustomProviderDefinition, settings: Settings
 ) -> ProviderConfig:
+    raw_key = definition.api_key.get_secret_value() if definition.api_key else None
+    pool = _build_api_key_pool(raw_key)
+    api_key = pool.current_key() if pool else raw_key
     return ProviderConfig(
-        api_key=definition.api_key.get_secret_value() if definition.api_key else None,
+        api_key=api_key,
         base_url=definition.base_url,
         proxy=None,
         http_read_timeout=settings.http_read_timeout,
@@ -101,4 +117,5 @@ def build_custom_provider_config(
         http_connect_timeout=settings.http_connect_timeout,
         log_raw_sse_events=settings.log_raw_sse_events,
         log_api_error_tracebacks=settings.log_api_error_tracebacks,
+        api_key_pool=pool,
     )
